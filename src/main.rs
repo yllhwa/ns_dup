@@ -1,4 +1,4 @@
-use std::net::SocketAddrV6;
+use std::net::{SocketAddrV6, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use nix::{errno::Errno, libc, libc::*, sys::socket};
 use nix::sys::socket::{LinkAddr, MsgFlags, SockaddrIn6};
@@ -8,14 +8,72 @@ use std::ffi::OsString;
 use std::env;
 mod route_nl;
 
+/// Parse IPv6 prefix in CIDR notation (e.g., "2001:db8::/32")
+fn parse_prefix(s: &str) -> (Ipv6Addr, u8) {
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 2 {
+        eprintln!("Invalid prefix format: {}. Expected format: 2001:db8::/32", s);
+        std::process::exit(1);
+    }
+
+    let addr: Ipv6Addr = parts[0].parse()
+        .expect(&format!("Invalid IPv6 address: {}", parts[0]));
+    let prefix_len: u8 = parts[1].parse()
+        .expect(&format!("Invalid prefix length: {}", parts[1]));
+
+    if prefix_len > 128 {
+        eprintln!("Prefix length must be between 0 and 128, got: {}", prefix_len);
+        std::process::exit(1);
+    }
+
+    (addr, prefix_len)
+}
+
+/// Check if an IPv6 address matches a given prefix using bit masking
+fn matches_prefix(addr: Ipv6Addr, prefix: Ipv6Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true; // /0 matches everything
+    }
+
+    let addr_bits = u128::from(addr);
+    let prefix_bits = u128::from(prefix);
+    let mask = !0u128 << (128 - prefix_len);
+
+    (addr_bits & mask) == (prefix_bits & mask)
+}
+
+/// Check if an IPv6 address matches any of the allowed prefixes
+fn matches_any_prefix(addr: Ipv6Addr, prefixes: &[(Ipv6Addr, u8)]) -> bool {
+    prefixes.iter().any(|(prefix, len)| matches_prefix(addr, *prefix, *len))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        println!("Usage: {} <WAN_IFACE> <LAN_IFACE>", args[0]);
-        return;
+    if args.len() < 3 {
+        eprintln!("Usage: {} <WAN_IFACE> <LAN_IFACE> [--allow-prefix PREFIX]...", args[0]);
+        eprintln!("Example: {} eth0 br-lan --allow-prefix 2001:db8::/32", args[0]);
+        std::process::exit(1);
     }
+
     let wan_name = &args[1];
     let lan_name = &args[2];
+
+    // Parse optional --allow-prefix flags
+    let mut prefixes: Vec<(Ipv6Addr, u8)> = Vec::new();
+    let mut i = 3;
+    while i < args.len() {
+        if args[i] == "--allow-prefix" {
+            if i + 1 >= args.len() {
+                eprintln!("--allow-prefix requires a value (e.g., 2001:db8::/32)");
+                std::process::exit(1);
+            }
+            prefixes.push(parse_prefix(&args[i + 1]));
+            i += 2;
+        } else {
+            eprintln!("Unknown argument: {}", args[i]);
+            std::process::exit(1);
+        }
+    }
 
     let mut val = 2;
     let socket_fd = unsafe {
@@ -120,6 +178,12 @@ fn main() {
         if eth_packet.get_source() == wan_iface.mac.unwrap(){
 
             let mut ns = pnet::packet::icmpv6::ndp::MutableNeighborSolicitPacket::new(&mut buffer[14+40..read_len]).unwrap();
+
+            // Prefix filtering: skip if prefixes are configured and target doesn't match
+            if !prefixes.is_empty() && !matches_any_prefix(ns.get_target_addr(), &prefixes) {
+                continue;
+            }
+
             // println!("{:?}",ns);
             // ns.set_options(&[]);
             ns.set_options(&[NdpOption{option_type:icmpv6::ndp::NdpOptionTypes::SourceLLAddr, length:1, data: lan_iface.mac.unwrap().octets().to_vec()}]);
